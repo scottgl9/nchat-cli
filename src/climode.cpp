@@ -67,7 +67,10 @@ void CliMode::MessageHandler(std::shared_ptr<ServiceMessage> p_ServiceMessage)
 
   std::lock_guard<std::mutex> lock(m_Mutex);
 
-  switch (p_ServiceMessage->GetMessageType())
+  int msgType = p_ServiceMessage->GetMessageType();
+  LOG_DEBUG("cli MessageHandler got type=%d", msgType);
+
+  switch (msgType)
   {
     case ConnectNotifyType:
       {
@@ -104,7 +107,7 @@ void CliMode::MessageHandler(std::shared_ptr<ServiceMessage> p_ServiceMessage)
           {
             m_ChatInfos.push_back(std::make_pair(notify->profileId, chatInfo));
           }
-          m_ResponseReceived = true;
+          m_ChatsReceived = true;
           m_LastSuccess = true;
           m_CondVar.notify_all();
         }
@@ -121,7 +124,7 @@ void CliMode::MessageHandler(std::shared_ptr<ServiceMessage> p_ServiceMessage)
           {
             m_ContactInfos[notify->profileId][contact.id] = contact;
           }
-          m_ResponseReceived = true;
+          m_ContactsReceived = true;
           m_LastSuccess = true;
           m_CondVar.notify_all();
         }
@@ -130,8 +133,14 @@ void CliMode::MessageHandler(std::shared_ptr<ServiceMessage> p_ServiceMessage)
 
     case NewMessagesNotifyType:
       {
+        LOG_DEBUG("cli message handler got NewMessagesNotifyType");
         std::shared_ptr<NewMessagesNotify> notify =
           std::dynamic_pointer_cast<NewMessagesNotify>(p_ServiceMessage);
+        LOG_DEBUG("cli message handler NewMessagesNotify notify=%p success=%d messages=%zu watchMode=%d",
+                 notify.get(),
+                 notify ? notify->success : false,
+                 notify ? notify->chatMessages.size() : 0,
+                 m_WatchMode);
         if (notify)
         {
           if (m_WatchMode)
@@ -169,7 +178,7 @@ void CliMode::MessageHandler(std::shared_ptr<ServiceMessage> p_ServiceMessage)
             }
             m_ChatMessagesProfileId = notify->profileId;
             m_ChatMessagesChatId = notify->chatId;
-            m_ResponseReceived = true;
+            m_MessagesReceived = true;
             m_LastSuccess = notify->success;
             m_CondVar.notify_all();
           }
@@ -259,17 +268,21 @@ std::string CliMode::ResolveProfile()
 
 int CliMode::Run(const std::string& p_Command, const std::map<std::string, std::string>& p_Options)
 {
+  LOG_DEBUG("cli run command=%s", p_Command.c_str());
+
   if (p_Command == "list-profiles")
   {
     return CmdListProfiles();
   }
 
   // For all other commands, we need a connection
+  LOG_DEBUG("cli waiting for connection...");
   if (!WaitForConnection(m_TimeoutSec))
   {
     std::cerr << "error: connection timed out after " << m_TimeoutSec << " seconds\n";
     return 1;
   }
+  LOG_DEBUG("cli connected");
 
   // Fetch contacts for name resolution (for all connected profiles)
   for (auto& protocol : m_Protocols)
@@ -424,7 +437,7 @@ int CliMode::CmdListChats(int p_Limit)
   {
     std::lock_guard<std::mutex> lock(m_Mutex);
     m_ChatInfos.clear();
-    m_ResponseReceived = false;
+    m_ChatsReceived = false;
   }
 
   // Fetch chats from cache
@@ -574,14 +587,54 @@ int CliMode::CmdReadMessages(const std::string& p_ChatId, int p_Limit)
     return 1;
   }
 
+  LOG_DEBUG("cli read messages profile=%s chat=%s limit=%d", profileId.c_str(), p_ChatId.c_str(), p_Limit);
+
+  auto it = m_Protocols.find(profileId);
+  if (it == m_Protocols.end())
+  {
+    std::cerr << "error: protocol not found for profile '" << profileId << "'\n";
+    return 1;
+  }
+
   {
     std::lock_guard<std::mutex> lock(m_Mutex);
     m_ChatMessages.clear();
-    m_ResponseReceived = false;
+    m_MessagesReceived = false;
   }
 
-  // Fetch from cache (synchronous - calls message handler directly)
-  MessageCache::FetchMessagesFrom(profileId, p_ChatId, "" /*fromMsgId*/, p_Limit, true /*sync*/);
+  // Request messages from protocol (async, will call message handler)
+  std::shared_ptr<GetMessagesRequest> request = std::make_shared<GetMessagesRequest>();
+  request->chatId = p_ChatId;
+  request->fromMsgId = "";
+  request->limit = p_Limit;
+  it->second->SendRequest(request);
+
+  // Wait for response
+  LOG_DEBUG("cli waiting for messages response...");
+  {
+    std::unique_lock<std::mutex> lock(m_Mutex);
+    LOG_DEBUG("cli wait - messagesReceived=%d timeout=%d", m_MessagesReceived, m_TimeoutSec);
+    bool gotResponse = m_CondVar.wait_for(lock, std::chrono::seconds(m_TimeoutSec), [this]
+    {
+      LOG_DEBUG("cli wait predicate check - messagesReceived=%d", m_MessagesReceived);
+      return m_MessagesReceived;
+    });
+    LOG_DEBUG("cli wait done - gotResponse=%d messagesReceived=%d", gotResponse, m_MessagesReceived);
+
+    if (!gotResponse)
+    {
+      std::cerr << "error: read timed out\n";
+      return 1;
+    }
+
+    if (!m_LastSuccess)
+    {
+      std::cerr << "error: read failed\n";
+      return 1;
+    }
+  }
+
+  LOG_DEBUG("cli fetch messages=%zu", m_ChatMessages.size());
 
   // Messages come in reverse chronological; reverse for display
   std::reverse(m_ChatMessages.begin(), m_ChatMessages.end());
@@ -736,7 +789,7 @@ int CliMode::CmdSearch(const std::string& p_ChatId, const std::string& p_Query)
     {
       std::lock_guard<std::mutex> lock(m_Mutex);
       m_ChatMessages.clear();
-      m_ResponseReceived = false;
+      m_MessagesReceived = false;
     }
 
     MessageCache::FetchMessagesFrom(profileId, p_ChatId, m_FindMsgId, 10, true /*sync*/);

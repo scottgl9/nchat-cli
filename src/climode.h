@@ -79,7 +79,9 @@ private:
   std::vector<ChatMessage> m_ChatMessages;
   std::string m_ChatMessagesProfileId;
   std::string m_ChatMessagesChatId;
-  bool m_ResponseReceived = false;
+  bool m_ChatsReceived = false;
+  bool m_ContactsReceived = false;
+  bool m_MessagesReceived = false;
   bool m_LastSuccess = false;
 
   // For send

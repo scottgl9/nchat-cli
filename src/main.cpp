@@ -487,21 +487,27 @@ int main(int argc, char* argv[])
   if (isCliMode)
   {
     // CLI mode
+    LOG_DEBUG("entering CLI mode, command=%s", cliCommand.c_str());
     protocols = cliMode->GetProtocols();
     hasProtocols = !protocols.empty();
+    LOG_DEBUG("CLI mode hasProtocols=%d count=%zu", hasProtocols, protocols.size());
     if (hasProtocols)
     {
       // Login protocols (blocking, in main thread)
       std::map<std::string, std::shared_ptr<Protocol>> protocolsSorted(protocols.begin(),
                                                                        protocols.end());
+      LOG_DEBUG("CLI mode logging in %zu protocols", protocolsSorted.size());
       for (auto& protocol : protocolsSorted)
       {
         protocol.second->SetMessageHandler(messageHandler);
         protocol.second->Login();
       }
+      LOG_DEBUG("CLI mode protocols logged in");
 
       // Run the CLI command
+      LOG_DEBUG("CLI mode calling Run()");
       cliResult = cliMode->Run(cliCommand, cliOptions);
+      LOG_DEBUG("CLI mode Run() returned %d", cliResult);
 
       // Logout
       for (auto& protocol : protocolsSorted)
