@@ -599,42 +599,82 @@ int CliMode::CmdReadMessages(const std::string& p_ChatId, int p_Limit)
   {
     std::lock_guard<std::mutex> lock(m_Mutex);
     m_ChatMessages.clear();
-    m_MessagesReceived = false;
   }
 
-  // Request messages from protocol (async, will call message handler)
-  std::shared_ptr<GetMessagesRequest> request = std::make_shared<GetMessagesRequest>();
-  request->chatId = p_ChatId;
-  request->fromMsgId = "";
-  request->limit = p_Limit;
-  it->second->SendRequest(request);
+  // Fetch messages in batches (pagination)
+  std::string fromMsgId = "";
+  int remainingLimit = p_Limit;
 
-  // Wait for response
-  LOG_DEBUG("cli waiting for messages response...");
+  while (remainingLimit > 0)
   {
-    std::unique_lock<std::mutex> lock(m_Mutex);
-    LOG_DEBUG("cli wait - messagesReceived=%d timeout=%d", m_MessagesReceived, m_TimeoutSec);
-    bool gotResponse = m_CondVar.wait_for(lock, std::chrono::seconds(m_TimeoutSec), [this]
     {
-      LOG_DEBUG("cli wait predicate check - messagesReceived=%d", m_MessagesReceived);
-      return m_MessagesReceived;
-    });
-    LOG_DEBUG("cli wait done - gotResponse=%d messagesReceived=%d", gotResponse, m_MessagesReceived);
-
-    if (!gotResponse)
-    {
-      std::cerr << "error: read timed out\n";
-      return 1;
+      std::lock_guard<std::mutex> lock(m_Mutex);
+      m_MessagesReceived = false;
     }
 
-    if (!m_LastSuccess)
+    // Request batch of messages
+    std::shared_ptr<GetMessagesRequest> request = std::make_shared<GetMessagesRequest>();
+    request->chatId = p_ChatId;
+    request->fromMsgId = fromMsgId;
+    request->limit = std::min(remainingLimit, 50); // Request up to 50 at a time
+    it->second->SendRequest(request);
+
+    // Wait for response
+    int batchSize = 0;
+    std::string oldestMsgId;
     {
-      std::cerr << "error: read failed\n";
-      return 1;
+      std::unique_lock<std::mutex> lock(m_Mutex);
+      bool gotResponse = m_CondVar.wait_for(lock, std::chrono::seconds(m_TimeoutSec), [this]
+      {
+        return m_MessagesReceived;
+      });
+
+      if (!gotResponse)
+      {
+        std::cerr << "error: read timed out\n";
+        return 1;
+      }
+
+      if (!m_LastSuccess)
+      {
+        std::cerr << "error: read failed\n";
+        return 1;
+      }
+
+      // Find the oldest message in our current list to use as the next fromMsgId
+      if (!m_ChatMessages.empty())
+      {
+        // Messages are in reverse chronological order, so the last one is oldest
+        oldestMsgId = m_ChatMessages.back().id;
+        batchSize = static_cast<int>(m_ChatMessages.size()) - (p_Limit - remainingLimit);
+        if (batchSize <= 0) batchSize = 1; // We got at least something
+      }
+
+      LOG_DEBUG("cli fetched batch: %d messages total so far, oldest=%s, target=%d",
+               static_cast<int>(m_ChatMessages.size()), oldestMsgId.c_str(), p_Limit);
     }
+
+    // If we got no new messages, we're done
+    if (batchSize == 0 || oldestMsgId.empty())
+    {
+      LOG_DEBUG("cli fetch stopping: no more messages");
+      break;
+    }
+
+    // If we have enough messages, we're done
+    if (static_cast<int>(m_ChatMessages.size()) >= p_Limit)
+    {
+      LOG_DEBUG("cli fetch stopping: reached limit");
+      break;
+    }
+
+    remainingLimit = p_Limit - static_cast<int>(m_ChatMessages.size());
+
+    // Continue from the oldest message we have
+    fromMsgId = oldestMsgId;
   }
 
-  LOG_DEBUG("cli fetch messages=%zu", m_ChatMessages.size());
+  LOG_DEBUG("cli fetch complete: %zu total messages", m_ChatMessages.size());
 
   // Messages come in reverse chronological; reverse for display
   std::reverse(m_ChatMessages.begin(), m_ChatMessages.end());
