@@ -163,6 +163,8 @@ endif()
 add_executable(nchat
   ext/apathy/path.hpp
   src/main.cpp
+  src/climode.cpp
+  src/climode.h
   src/ui.cpp
   src/ui.h
   src/uichatlistdialog.cpp

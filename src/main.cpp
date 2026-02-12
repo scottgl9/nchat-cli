@@ -26,6 +26,7 @@
 #include "scopeddirlock.h"
 #include "status.h"
 #include "sysutil.h"
+#include "climode.h"
 #include "ui.h"
 
 #ifdef HAS_DUMMY
@@ -148,6 +149,14 @@ int main(int argc, char* argv[])
   bool isKeyDump = false;
   bool isRemove = false;
   bool isSetup = false;
+
+  // CLI mode arguments
+  std::string cliCommand;
+  std::map<std::string, std::string> cliOptions;
+  bool cliJson = false;
+  std::string cliProfile;
+  int cliTimeout = 30;
+
   std::vector<std::string> args(argv + 1, argv + argc);
   for (auto it = args.begin(); it != args.end(); ++it)
   {
@@ -201,12 +210,63 @@ int main(int argc, char* argv[])
       ++it;
       exportDir = *it;
     }
+    else if ((*it == "--cmd") && (std::distance(it + 1, args.end()) > 0))
+    {
+      ++it;
+      cliCommand = *it;
+    }
+    else if ((*it == "--chat") && (std::distance(it + 1, args.end()) > 0))
+    {
+      ++it;
+      cliOptions["chat"] = *it;
+    }
+    else if ((*it == "--text") && (std::distance(it + 1, args.end()) > 0))
+    {
+      ++it;
+      cliOptions["text"] = *it;
+    }
+    else if ((*it == "--file") && (std::distance(it + 1, args.end()) > 0))
+    {
+      ++it;
+      cliOptions["file"] = *it;
+    }
+    else if ((*it == "--query") && (std::distance(it + 1, args.end()) > 0))
+    {
+      ++it;
+      cliOptions["query"] = *it;
+    }
+    else if ((*it == "--msg") && (std::distance(it + 1, args.end()) > 0))
+    {
+      ++it;
+      cliOptions["msg"] = *it;
+    }
+    else if ((*it == "--limit") && (std::distance(it + 1, args.end()) > 0))
+    {
+      ++it;
+      cliOptions["limit"] = *it;
+    }
+    else if ((*it == "--profile") && (std::distance(it + 1, args.end()) > 0))
+    {
+      ++it;
+      cliProfile = *it;
+    }
+    else if ((*it == "--timeout") && (std::distance(it + 1, args.end()) > 0))
+    {
+      ++it;
+      cliTimeout = std::stoi(*it);
+    }
+    else if (*it == "--json")
+    {
+      cliJson = true;
+    }
     else
     {
       ShowHelp();
       return 1;
     }
   }
+
+  bool isCliMode = !cliCommand.empty();
 
   bool isDirInited = false;
   static const int dirVersion = 1;
@@ -320,12 +380,31 @@ int main(int argc, char* argv[])
   // Init temp
   FileUtil::InitTempDir();
 
-  // Init ui
-  std::shared_ptr<Ui> ui = std::make_shared<Ui>();
+  // Init UI or CLI mode
+  std::shared_ptr<Ui> ui;
+  std::shared_ptr<CliMode> cliMode;
+  std::function<void(std::shared_ptr<ServiceMessage>)> messageHandler;
+
+  if (isCliMode)
+  {
+    cliMode = std::make_shared<CliMode>();
+    cliMode->SetOutputJson(cliJson);
+    cliMode->SetTimeout(cliTimeout);
+    if (!cliProfile.empty())
+    {
+      cliMode->SetProfile(cliProfile);
+    }
+    messageHandler =
+      std::bind(&CliMode::MessageHandler, std::ref(*cliMode), std::placeholders::_1);
+  }
+  else
+  {
+    ui = std::make_shared<Ui>();
+    messageHandler =
+      std::bind(&Ui::MessageHandler, std::ref(*ui), std::placeholders::_1);
+  }
 
   // Set message cache message handler
-  std::function<void(std::shared_ptr<ServiceMessage>)> messageHandler =
-    std::bind(&Ui::MessageHandler, std::ref(*ui), std::placeholders::_1);
   MessageCache::SetMessageHandler(messageHandler);
 
   // Load profile(s)
@@ -345,17 +424,23 @@ int main(int argc, char* argv[])
     }
 
 #ifndef HAS_MULTIPROTOCOL
-    if (!ui->GetProtocols().empty())
     {
-      LOG_WARNING("multiple profile support not enabled, skipping %s", profileId.c_str());
-      continue;
+      auto currentProtocols = isCliMode ? cliMode->GetProtocols() : ui->GetProtocols();
+      if (!currentProtocols.empty())
+      {
+        LOG_WARNING("multiple profile support not enabled, skipping %s", profileId.c_str());
+        continue;
+      }
     }
 #endif
 
     if (setupProtocol && (setupProtocol->GetProfileId() == profileId))
     {
       LOG_DEBUG("adding new profile %s", profileId.c_str());
-      ui->AddProtocol(setupProtocol);
+      if (isCliMode)
+        cliMode->AddProtocol(setupProtocol);
+      else
+        ui->AddProtocol(setupProtocol);
       setupProtocol.reset();
     }
     else
@@ -371,7 +456,10 @@ int main(int argc, char* argv[])
           if (protocol)
           {
             protocol->LoadProfile(profilesDir, profileId);
-            ui->AddProtocol(protocol);
+            if (isCliMode)
+              cliMode->AddProtocol(protocol);
+            else
+              ui->AddProtocol(protocol);
             found = true;
           }
         }
@@ -392,45 +480,80 @@ int main(int argc, char* argv[])
     }
   }
 
-  // Start protocol(s) and ui
-  ui->Init();
-  std::unordered_map<std::string, std::shared_ptr<Protocol>> protocols = ui->GetProtocols();
-  bool hasProtocols = !protocols.empty();
-  if (hasProtocols && exportDir.empty())
+  int cliResult = 0;
+  std::unordered_map<std::string, std::shared_ptr<Protocol>> protocols;
+  bool hasProtocols = false;
+
+  if (isCliMode)
   {
-    // Sort protocols
-    std::map<std::string, std::shared_ptr<Protocol>> protocolsSorted(protocols.begin(), protocols.end());
-
-    // Connecting status
-    for (auto& protocol : protocolsSorted)
+    // CLI mode
+    protocols = cliMode->GetProtocols();
+    hasProtocols = !protocols.empty();
+    if (hasProtocols)
     {
-      Status::Set(protocol.first, Status::FlagConnecting);
-    }
-
-    // Login
-    std::thread loginThread([&]
-    {
+      // Login protocols (blocking, in main thread)
+      std::map<std::string, std::shared_ptr<Protocol>> protocolsSorted(protocols.begin(),
+                                                                       protocols.end());
       for (auto& protocol : protocolsSorted)
       {
         protocol.second->SetMessageHandler(messageHandler);
         protocol.second->Login();
       }
-    });
 
-    // Ui main loop
-    ui->Run();
+      // Run the CLI command
+      cliResult = cliMode->Run(cliCommand, cliOptions);
 
-    // Cleanup login thread
-    if (loginThread.joinable())
-    {
-      loginThread.join();
+      // Logout
+      for (auto& protocol : protocolsSorted)
+      {
+        protocol.second->Logout();
+        protocol.second->CloseProfile();
+      }
     }
-
-    // Logout
-    for (auto& protocol : protocolsSorted)
+  }
+  else
+  {
+    // TUI mode
+    ui->Init();
+    protocols = ui->GetProtocols();
+    hasProtocols = !protocols.empty();
+    if (hasProtocols && exportDir.empty())
     {
-      protocol.second->Logout();
-      protocol.second->CloseProfile();
+      // Sort protocols
+      std::map<std::string, std::shared_ptr<Protocol>> protocolsSorted(protocols.begin(),
+                                                                       protocols.end());
+
+      // Connecting status
+      for (auto& protocol : protocolsSorted)
+      {
+        Status::Set(protocol.first, Status::FlagConnecting);
+      }
+
+      // Login
+      std::thread loginThread([&]
+      {
+        for (auto& protocol : protocolsSorted)
+        {
+          protocol.second->SetMessageHandler(messageHandler);
+          protocol.second->Login();
+        }
+      });
+
+      // Ui main loop
+      ui->Run();
+
+      // Cleanup login thread
+      if (loginThread.joinable())
+      {
+        loginThread.join();
+      }
+
+      // Logout
+      for (auto& protocol : protocolsSorted)
+      {
+        protocol.second->Logout();
+        protocol.second->CloseProfile();
+      }
     }
   }
 
@@ -438,8 +561,12 @@ int main(int argc, char* argv[])
   MessageCache::SetMessageHandler(nullptr);
 
   // Cleanup ui
-  ui->Cleanup();
-  ui.reset();
+  if (ui)
+  {
+    ui->Cleanup();
+    ui.reset();
+  }
+  cliMode.reset();
 
   // Perform export if requested
   if (!exportDir.empty())
@@ -459,7 +586,15 @@ int main(int argc, char* argv[])
 
   // Exit code
   int rv = 0;
-  if (!hasProtocols)
+  if (isCliMode)
+  {
+    rv = hasProtocols ? cliResult : 1;
+    if (!hasProtocols)
+    {
+      std::cerr << "No profiles setup, exiting.\n";
+    }
+  }
+  else if (!hasProtocols)
   {
     std::cout << "No profiles setup, exiting.\n";
     rv = 1;
@@ -620,6 +755,7 @@ void ShowHelp()
     "nchat is a terminal-based telegram / whatsapp client.\n"
     "\n"
     "Usage: nchat [OPTION]\n"
+    "       nchat --cmd <command> [options]\n"
     "\n"
     "Command-line Options:\n"
     "    -d, --confdir <DIR>    use a different directory than ~/.config/nchat\n"
@@ -632,6 +768,36 @@ void ShowHelp()
     "    -s, --setup            set up chat protocol account\n"
     "    -v, --version          output version information and exit\n"
     "    -x, --export <DIR>     export message cache to specified dir\n"
+    "\n"
+    "CLI Mode Commands (non-interactive):\n"
+    "    --cmd list-profiles    list configured profiles\n"
+    "    --cmd list-chats       list all conversations\n"
+    "    --cmd list-contacts    list all contacts\n"
+    "    --cmd read             read messages from a chat\n"
+    "    --cmd send             send a message\n"
+    "    --cmd search           search messages in a chat\n"
+    "    --cmd mark-read        mark a message as read\n"
+    "    --cmd watch            stream incoming messages\n"
+    "\n"
+    "CLI Mode Options:\n"
+    "    --chat <ID>            chat id for read/send/search/mark-read/watch\n"
+    "    --text <MSG>           message text for send (or pipe via stdin)\n"
+    "    --file <PATH>          file attachment path for send\n"
+    "    --query <TEXT>         search query for search command\n"
+    "    --msg <ID>             message id for mark-read\n"
+    "    --limit <N>            limit number of results (default: 20 for read)\n"
+    "    --profile <ID>         select profile (e.g. Telegram_0, WhatsAppMd_0)\n"
+    "    --timeout <SEC>        connection timeout in seconds (default: 30)\n"
+    "    --json                 output in JSON format\n"
+    "\n"
+    "CLI Mode Examples:\n"
+    "    nchat --cmd list-profiles\n"
+    "    nchat --cmd list-chats --json\n"
+    "    nchat --cmd read --chat <id> --limit 10\n"
+    "    nchat --cmd send --chat <id> --text \"hello\"\n"
+    "    echo \"hello\" | nchat --cmd send --chat <id>\n"
+    "    nchat --cmd search --chat <id> --query \"keyword\"\n"
+    "    nchat --cmd watch --json\n"
     "\n"
     "Interactive Commands:\n"
     "    PageDn      history next page\n"
