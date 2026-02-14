@@ -162,7 +162,7 @@ void CliMode::MessageHandler(std::shared_ptr<ServiceMessage> p_ServiceMessage)
                 std::string senderName = msg.isOutgoing
                   ? "You"
                   : GetContactName(notify->profileId, msg.senderId);
-                std::string timeStr = TimeUtil::GetTimeString(msg.timeSent, false /*p_IsExport*/);
+                std::string timeStr = TimeUtil::GetTimeString(msg.timeSent, true /*p_IsExport*/);
                 std::cout << "[" << timeStr << "] "
                           << notify->chatId << " | "
                           << senderName << ": " << msg.text << "\n";
@@ -701,7 +701,7 @@ int CliMode::CmdReadMessages(const std::string& p_ChatId, int p_Limit)
       std::string senderName = msg.isOutgoing
         ? "You"
         : GetContactName(profileId, msg.senderId);
-      std::string timeStr = TimeUtil::GetTimeString(msg.timeSent, false /*p_IsExport*/);
+      std::string timeStr = TimeUtil::GetTimeString(msg.timeSent, true /*p_IsExport*/);
       std::string line = "[" + timeStr + "] " + senderName + ": " + msg.text;
       if (!msg.fileInfo.empty())
       {
@@ -857,7 +857,7 @@ int CliMode::CmdSearch(const std::string& p_ChatId, const std::string& p_Query)
         std::string senderName = msg.isOutgoing
           ? "You"
           : GetContactName(profileId, msg.senderId);
-        std::string timeStr = TimeUtil::GetTimeString(msg.timeSent, false /*p_IsExport*/);
+        std::string timeStr = TimeUtil::GetTimeString(msg.timeSent, true /*p_IsExport*/);
         std::string marker = (msg.id == m_FindMsgId) ? ">>> " : "    ";
         OutputText(marker + "[" + timeStr + "] " + senderName + ": " + msg.text);
       }
